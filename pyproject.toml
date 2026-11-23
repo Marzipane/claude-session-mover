@@ -1,0 +1,30 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "claude-session-mover"
+version = "0.1.0"
+description = "Copy or move Claude Code sessions (chat history) between Claude accounts, with dry runs and automatic backups."
+readme = "README.md"
+license = { text = "MIT" }
+requires-python = ">=3.8"
+authors = [{ name = "Marzipane" }]
+keywords = ["claude-code", "claude", "cli", "migration", "sessions"]
+classifiers = [
+    "Environment :: Console",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: MacOS",
+    "Operating System :: POSIX :: Linux",
+    "Programming Language :: Python :: 3",
+]
+
+[project.urls]
+Homepage = "https://github.com/Marzipane/claude-session-mover"
+Issues = "https://github.com/Marzipane/claude-session-mover/issues"
+
+[project.scripts]
+claude-session-mover = "claude_session_mover:main"
+
+[tool.setuptools]
+py-modules = ["claude_session_mover"]

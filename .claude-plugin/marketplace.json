@@ -1,0 +1,14 @@
+{
+  "name": "claude-session-mover",
+  "owner": { "name": "Marzipane" },
+  "description": "Move Claude Code sessions between Claude accounts",
+  "plugins": [
+    {
+      "name": "claude-session-mover",
+      "source": "./",
+      "description": "Skill that installs claude-session-mover and moves sessions between accounts after a dry run and your confirmation",
+      "category": "productivity",
+      "keywords": ["claude-code", "sessions", "migration"]
+    }
+  ]
+}
