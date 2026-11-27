@@ -35,7 +35,7 @@ def snapshot(root: Path) -> dict:
     """Every file under root with its bytes, so a test can prove nothing changed."""
     if not root.exists():
         return {}
-    return {str(p.relative_to(root)): p.read_bytes() for p in sorted(root.rglob("*")) if p.is_file()}
+    return {p.relative_to(root).as_posix(): p.read_bytes() for p in sorted(root.rglob("*")) if p.is_file()}
 
 
 class Sandbox(unittest.TestCase):

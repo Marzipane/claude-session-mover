@@ -250,7 +250,8 @@ def resolve_location(value: str, desktop_root: Path) -> Location:
             if location.root.resolve() == path.resolve():
                 return location
         return Location("cli", path, str(path))
-    if value.startswith(("/", "~", ".")):
+    # A Desktop account is named "<account>/<org>", so a "/" alone does not make a path; a drive or "\\" does.
+    if value.startswith(("/", "~", ".")) or os.path.isabs(value) or (sys.platform == "win32" and "\\" in value):
         raise UsageError(f"folder not found: {value}")
     return _desktop_location_by_prefix(value, desktop_root)
 
