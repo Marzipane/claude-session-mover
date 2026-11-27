@@ -11,24 +11,30 @@ Two places hold sessions, and this tool calls each one a *store*:
            points at). Each keeps its transcripts in projects/<project>/<id>.jsonl.
 
 Only session files are read or written. Credentials (.credentials.json,
-.claude.json, the keychain) are never opened.
+.claude.json, the keychain) are never opened. `sync` and its macOS LaunchAgent
+(`install-agent`) keep every Desktop account folder identical automatically.
 """
 from __future__ import annotations
 
 import argparse
+import contextlib
+import fcntl
+import hashlib
 import json
 import os
+import plistlib
 import re
 import shutil
+import stat
 import subprocess
 import sys
 import tempfile
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, List, Optional, Sequence, Set, Tuple
+from typing import Dict, Iterator, List, Optional, Sequence, Set, Tuple
 
-__version__ = "0.1.0"
+__version__ = "0.2.0"
 PROG = "claude-session-mover"
 MANIFEST = "manifest.json"
 MIN_ID_PREFIX = 4
@@ -494,6 +500,197 @@ def remove_created_dirs(backup: Path) -> List[str]:
     return removed
 
 
+# --------------------------------------------------------------------------- sync (every Desktop account alike)
+
+
+@dataclass(frozen=True)
+class SyncOp:
+    """`add`/`update` copy `source` to `path`; `remove` moves the chat at `path` into the trash."""
+
+    kind: str
+    rel: str
+    path: Path
+    source: Optional[Path] = None
+
+
+def _is_chat_index(rel: str) -> bool:
+    return "/" not in rel and rel.startswith("local_") and rel.endswith(".json")
+
+
+def _sync_inventory(folders: Sequence[Path]) -> Dict[str, Dict[Path, os.stat_result]]:
+    """Relative path -> {folder: stat} for every regular, non-hidden file in every account folder."""
+    found: Dict[str, Dict[Path, os.stat_result]] = {}
+    for folder in folders:
+        for dirpath, dirnames, filenames in os.walk(folder):
+            dirnames[:] = [d for d in dirnames if not d.startswith(".")]
+            for name in filenames:
+                if name.startswith("."):
+                    continue
+                path = Path(dirpath) / name
+                st = path.lstat()
+                if stat.S_ISREG(st.st_mode):
+                    found.setdefault(str(path.relative_to(folder)), {})[folder] = st
+    return found
+
+
+def _sync_version(path: Path, rel: str, st: os.stat_result) -> Optional[Tuple[float, int]]:
+    """Sort key for 'which copy is newest'; None while a chat index cannot be parsed (Claude may be mid-save)."""
+    if not _is_chat_index(rel):
+        return (0, st.st_mtime_ns)
+    try:
+        index = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    return (index.get("lastActivityAt") or 0, st.st_mtime_ns)
+
+
+def plan_sync(root: Path) -> Tuple[List[Path], List[SyncOp]]:
+    """The account folders under `root` and the ops that make every one hold the newest copy of every file."""
+    folders = [location.root for location in desktop_locations(root)]
+    files = _sync_inventory(folders)
+    deleted = {rel[len("deleted_"):] for rel in files if "/" not in rel and rel.startswith("deleted_")}
+    ops: List[SyncOp] = []
+    for rel, where in sorted(files.items()):
+        if _is_chat_index(rel) and rel[len("local_"):-len(".json")] in deleted:
+            ops += [SyncOp("remove", rel, folder / rel) for folder in where]
+            continue
+        if len(where) == len(folders) and len({(st.st_size, st.st_mtime_ns) for st in where.values()}) == 1:
+            continue
+        versions = {folder: _sync_version(folder / rel, rel, st) for folder, st in where.items()}
+        if any(v is None for v in versions.values()):
+            continue
+        newest = max(where, key=lambda folder: versions[folder])
+        for folder in folders:
+            if folder == newest:
+                continue
+            if folder not in where:
+                ops.append(SyncOp("add", rel, folder / rel, newest / rel))
+            elif versions[folder] < versions[newest]:
+                ops.append(SyncOp("update", rel, folder / rel, newest / rel))
+    return folders, ops
+
+
+def apply_sync(ops: Sequence[SyncOp], root: Path, trash: Path) -> None:
+    day = trash / time.strftime("%Y%m%d")
+    for op in ops:
+        if op.kind == "remove":
+            if op.path.exists():
+                aside = day / op.path.relative_to(root)
+                aside.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+                shutil.move(str(op.path), str(aside))
+            continue
+        assert op.source is not None
+        op.path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+        _atomic_copy(op.source, op.path)
+
+
+def sync_summary(ops: Sequence[SyncOp]) -> List[str]:
+    counts: Dict[Tuple[str, str], int] = {}
+    for op in ops:
+        counts[(op.kind, op.rel)] = counts.get((op.kind, op.rel), 0) + 1
+    return [f"{kind} {rel} ({n} folder{'s' if n > 1 else ''})" for (kind, rel), n in sorted(counts.items())]
+
+
+def default_data_dir() -> Path:
+    return Path(os.environ.get("XDG_DATA_HOME") or Path.home() / ".local" / "share") / PROG
+
+
+@contextlib.contextmanager
+def sync_lock(root: Path) -> Iterator[bool]:
+    """Yield True when this process holds the lock for `root`, False when another sync already runs."""
+    locks = default_data_dir() / "locks"
+    locks.mkdir(parents=True, exist_ok=True, mode=0o700)
+    key = hashlib.sha1(str(root.resolve()).encode()).hexdigest()[:10]
+    with (locks / f"sync-{key}.lock").open("w") as lock:
+        try:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            yield False
+            return
+        yield True
+
+
+# --------------------------------------------------------------------------- the sync agent (macOS LaunchAgent)
+
+AGENT_LABEL = "io.github.marzipane.claude-session-mover.sync"
+AGENT_INTERVAL_SECONDS = 20
+
+
+def _require_macos() -> None:
+    if sys.platform != "darwin":
+        raise UsageError("the sync agent is a macOS LaunchAgent; elsewhere, run "
+                         f"'{PROG} sync --quiet' from a systemd timer or cron")
+
+
+def agent_plist_path() -> Path:
+    return Path.home() / "Library" / "LaunchAgents" / f"{AGENT_LABEL}.plist"
+
+
+def agent_log_path() -> Path:
+    return default_data_dir() / "sync.log"
+
+
+def _launchctl(*args: str) -> subprocess.CompletedProcess:
+    binary = os.environ.get("CLAUDE_SESSION_MOVER_LAUNCHCTL", "launchctl")
+    return subprocess.run([binary, *args], capture_output=True, text=True, timeout=10)
+
+
+def _gui_domain() -> str:
+    return f"gui/{os.getuid()}"
+
+
+def agent_job_state() -> Optional[str]:
+    """launchctl's description of the loaded agent, or None when it is not loaded."""
+    shown = _launchctl("print", f"{_gui_domain()}/{AGENT_LABEL}")
+    return shown.stdout if shown.returncode == 0 else None
+
+
+def _run_launchctl(*args: str) -> None:
+    done = _launchctl(*args)
+    if done.returncode != 0:
+        raise UsageError(f"launchctl {' '.join(args)} failed: {(done.stderr or done.stdout).strip()}")
+
+
+def agent_definition(desktop_root: Path) -> Dict[str, object]:
+    log = str(agent_log_path())
+    return {
+        "Label": AGENT_LABEL,
+        # -I keeps the user's site-packages and current folder out of the agent's imports; the tool is stdlib-only.
+        "ProgramArguments": [sys.executable, "-I", str(Path(__file__).resolve()),
+                             "sync", "--quiet", "--desktop-root", str(desktop_root)],
+        # WatchPaths fires on changes to these folders themselves; the interval covers new account folders.
+        "WatchPaths": [str(desktop_root)] + [str(loc.root) for loc in desktop_locations(desktop_root)],
+        "StartInterval": AGENT_INTERVAL_SECONDS,
+        "RunAtLoad": True,
+        "ProcessType": "Background",
+        "LowPriorityIO": True,
+        "StandardOutPath": log,
+        "StandardErrorPath": log,
+    }
+
+
+def agent_problems() -> List[str]:
+    """Everything wrong with the installed agent; empty when it is healthy."""
+    plist = agent_plist_path()
+    if not plist.exists():
+        return [f"not installed (no {plist}); run '{PROG} install-agent'"]
+    problems = []
+    with plist.open("rb") as f:
+        arguments = plistlib.load(f).get("ProgramArguments", [])
+    script = Path(arguments[2]) if len(arguments) > 2 else None
+    if script is None or not script.exists():
+        problems.append(f"script missing: {script}; run '{PROG} install-agent' again")
+    state = agent_job_state()
+    if state is None:
+        problems.append(f"agent is not loaded; run '{PROG} install-agent' again")
+    else:
+        found = re.search(r"last exit code = (\S+)", state)
+        code = found.group(1) if found else "(never"
+        if code not in ("0", "(never"):
+            problems.append(f"last run failed (exit code {code}); see {agent_log_path()}")
+    return problems
+
+
 # --------------------------------------------------------------------------- safety checks
 
 
@@ -666,6 +863,75 @@ def cmd_restore(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_sync(args: argparse.Namespace) -> int:
+    # No running-app check and no per-run backup: sync is meant to run every few seconds while
+    # Claude Desktop is open, and whatever the app rewrites is picked up by the next run.
+    with sync_lock(args.desktop_root) as held:
+        if not held:
+            return 0
+        folders, ops = plan_sync(args.desktop_root)
+        if not args.dry_run:
+            apply_sync(ops, args.desktop_root, args.trash or default_data_dir() / "removed")
+    if not ops:
+        if not args.quiet:
+            print(f"{len(folders)} account folders in step, nothing to do")
+        return 0
+    prefix = time.strftime("[%Y-%m-%d %H:%M:%S] ") if args.quiet else ""
+    verb = "would " if args.dry_run else ""
+    for line in sync_summary(ops):
+        print(f"{prefix}{verb}{line}")
+    return 0
+
+
+def cmd_install_agent(args: argparse.Namespace) -> int:
+    _require_macos()
+    if not args.desktop_root.is_dir():
+        raise UsageError(f"no Claude Desktop sessions folder at {args.desktop_root}")
+    plist = agent_plist_path()
+    plist.parent.mkdir(parents=True, exist_ok=True)
+    agent_log_path().parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    if agent_job_state() is not None:
+        _run_launchctl("bootout", f"{_gui_domain()}/{AGENT_LABEL}")
+    fd, tmp = tempfile.mkstemp(dir=plist.parent, prefix=".csm-")
+    with os.fdopen(fd, "wb") as f:
+        plistlib.dump(agent_definition(args.desktop_root), f)
+    os.replace(tmp, plist)
+    _run_launchctl("bootstrap", _gui_domain(), str(plist))
+    print(f"Installed and started {AGENT_LABEL}: syncs every {AGENT_INTERVAL_SECONDS} s and on folder changes.")
+    print(f"Agent: {plist}")
+    print(f"Log:   {agent_log_path()}")
+    print(f"Check it with '{PROG} status'; stop it with '{PROG} uninstall-agent'.")
+    return 0
+
+
+def cmd_uninstall_agent(args: argparse.Namespace) -> int:
+    _require_macos()
+    plist = agent_plist_path()
+    loaded, defined = agent_job_state() is not None, plist.exists()
+    if loaded:
+        _run_launchctl("bootout", f"{_gui_domain()}/{AGENT_LABEL}")
+    if defined:
+        plist.unlink()
+    print(f"Removed {AGENT_LABEL}." if loaded or defined else f"{AGENT_LABEL} was not installed.")
+    return 0
+
+
+def cmd_status(args: argparse.Namespace) -> int:
+    """Exit 0 when the agent is healthy, 1 when it is not, so hooks and scripts can test it."""
+    _require_macos()
+    problems = agent_problems()
+    folders, ops = plan_sync(args.desktop_root)
+    pending = f"{len(ops)} changes waiting for the next run" if ops else "in step"
+    print(f"{len(folders)} Claude Desktop account folders: {pending}")
+    if not problems:
+        print(f"Sync agent {AGENT_LABEL}: healthy")
+        return 0
+    print(f"Sync agent {AGENT_LABEL}: NOT working")
+    for problem in problems:
+        print(f"  - {problem}")
+    return 1
+
+
 def _add_app_flags(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--wait-for-app-exit", type=int, nargs="?", const=600, default=0, metavar="SECONDS",
                         help="if Claude Desktop is running, wait for it to quit (default 600 s), then write")
@@ -712,6 +978,26 @@ def build_parser() -> argparse.ArgumentParser:
     restore.add_argument("--dry-run", action="store_true")
     _add_app_flags(restore)
     restore.set_defaults(handler=cmd_restore)
+
+    sync = commands.add_parser(
+        "sync", parents=[common], help="make every Claude Desktop account show the same chats",
+        description="Bring every <account>/<org> folder to the newest copy of every file. Chat index files: the "
+                    "larger lastActivityAt wins, then the newer mtime; other files: the newer mtime wins. A "
+                    "deleted_<id> marker moves that chat out of every folder into --trash. Safe to run repeatedly.")
+    sync.add_argument("--dry-run", action="store_true", help="print every change and make none")
+    sync.add_argument("--quiet", action="store_true", help="print only when something changed (for the agent)")
+    sync.add_argument("--trash", type=Path, default=None,
+                      help="where chats deleted in another account are moved "
+                           "(default ~/.local/share/claude-session-mover/removed)")
+    sync.set_defaults(handler=cmd_sync)
+
+    for name, summary, handler in (
+        ("install-agent", "macOS: run 'sync' automatically (every 20 s and on changes) as a LaunchAgent",
+         cmd_install_agent),
+        ("uninstall-agent", "macOS: stop and remove the sync agent", cmd_uninstall_agent),
+        ("status", "macOS: is the sync agent installed, loaded and succeeding? (exit 1 when not)", cmd_status),
+    ):
+        commands.add_parser(name, parents=[common], help=summary, description=summary).set_defaults(handler=handler)
     return parser
 
 

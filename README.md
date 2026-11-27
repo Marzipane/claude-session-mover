@@ -7,6 +7,12 @@ curl -fsSL https://raw.githubusercontent.com/Marzipane/claude-session-mover/main
 claude-session-mover list
 ```
 
+Or keep every Claude Desktop account showing the same chats, automatically (macOS):
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/Marzipane/claude-session-mover/main/install.sh | sh -s -- --auto-sync
+```
+
 ## The problem
 
 Claude keeps the list of your Code sessions per account. Sign in with a different account and your earlier chats disappear from the sidebar or from `claude --resume`, even though they are still on disk. This tool brings them over, shows you every change first, and backs up whatever it is about to change.
@@ -29,6 +35,7 @@ With the CLI, people usually keep one config dir per account (`CLAUDE_CONFIG_DIR
 | Way | Command |
 |---|---|
 | One-liner (uses uv or pipx if you have them, else drops one file into `~/.local/bin`) | `curl -fsSL https://raw.githubusercontent.com/Marzipane/claude-session-mover/main/install.sh \| sh` |
+| One-liner plus the auto-sync agent (macOS) | `curl -fsSL https://raw.githubusercontent.com/Marzipane/claude-session-mover/main/install.sh \| sh -s -- --auto-sync` |
 | pipx | `pipx install git+https://github.com/Marzipane/claude-session-mover` |
 | uv | `uv tool install git+https://github.com/Marzipane/claude-session-mover` |
 | By hand | download `claude_session_mover.py`, `chmod +x`, put it on your `PATH` |
@@ -71,6 +78,31 @@ What happens to each session:
 
 `move` removes a session from the source only after it is in the target, and never for skipped sessions.
 
+## Automatic sync between Claude Desktop accounts (macOS)
+
+If you switch Claude Desktop accounts often, let the tool keep every account folder identical instead of copying by hand:
+
+```bash
+claude-session-mover sync --dry-run     # what one sync would change
+claude-session-mover install-agent      # run sync every 20 s and whenever the folders change
+claude-session-mover status             # is it installed, loaded and succeeding? (exit 1 when not)
+claude-session-mover uninstall-agent    # stop it and remove it
+```
+
+`sync` works on every `<account>/<org>` folder at once and copies every file in them (chat index files, `archived-sessions.idx`, scheduled tasks, waiting-input state), so archiving, renaming and scheduled tasks carry over too:
+
+| Situation | Result |
+|---|---|
+| A file is missing in some folders | copied there, with its modification time |
+| Chat index files differ | the larger `lastActivityAt` wins, then the newer modification time |
+| Other files differ | the newer modification time wins |
+| A chat was deleted in any account (`deleted_<id>` marker) | moved out of every folder into `~/.local/share/claude-session-mover/removed/<date>/` (`--trash` to change), and the marker spreads |
+| A chat index cannot be parsed (the app may be mid-save) | left alone until the next run |
+
+Unlike `copy` and `move`, `sync` runs while Claude Desktop is open and makes no per-run backup: it runs every 20 seconds, and the next run picks up whatever the app rewrites. Chats from another account show up in the sidebar after you restart the app or switch accounts, because Desktop reads its folder only then. The agent's log is `~/.local/share/claude-session-mover/sync.log`.
+
+Put `claude-session-mover status >/dev/null || echo "chat sync is broken"` in a shell profile or a Claude Code `SessionStart` hook to hear about it when the agent stops working (for example after the Python it was installed with is removed; `install-agent` again fixes that).
+
 ### Settings
 
 | Flag | Environment variable | Default |
@@ -105,7 +137,7 @@ Then tell Claude: *"Use claude-session-mover to set up session moving on this ma
 
 - **Backup before every write.** Before changing anything, the tool copies every file it will overwrite or remove into a timestamped folder under the backup dir. It also writes a `manifest.json` listing every file it will create. The manifest is complete before the first change, so an interrupted run can still be undone. `restore-backup` puts each file back, deletes files the run created, and removes folders it created once they are empty. A restore is itself backed up, so you can undo it too.
 - **Dry run first.** `--dry-run` prints every path that would be written (`new` or `overwrite`) or removed, then exits without touching anything.
-- **Credentials are never touched.** Only `local_*.json` (Desktop) and `projects/` (CLI) are read or written. `.credentials.json`, `.claude.json`, the macOS keychain and settings files are never opened.
+- **Credentials are never touched.** Only `local_*.json` (Desktop) and `projects/` (CLI) are read or written; `sync` also copies the other app-state files inside the `claude-code-sessions/<account>/<org>/` folders, and nothing outside them. `.credentials.json`, `.claude.json`, the macOS keychain and settings files are never opened.
 - **Atomic writes.** Each file is written to a temporary file in the same folder and then renamed into place. Modification times are kept.
 - **Claude Desktop must be closed.** It rewrites its session index when it quits, which would undo a change made while it runs. On macOS the tool refuses to write Desktop folders while the app runs. `--wait-for-app-exit [SECONDS]` waits for you to quit it (default 600 s) and then writes. Reopen the app afterwards to see the chats.
 - Backups contain copies of your session data. They stay on your machine with `0700` folder permissions. Delete old ones when you no longer need them.
@@ -124,7 +156,7 @@ Then tell Claude: *"Use claude-session-mover to set up session moving on this ma
 python3 -m unittest discover -s tests -v
 ```
 
-The tests build synthetic Desktop and CLI account folders in a temporary `HOME`. They cover list, copy, move, dry run, backups, restore, idempotency, conflict handling, missing folders and the running-app guard.
+The tests build synthetic Desktop and CLI account folders in a temporary `HOME`. They cover list, copy, move, dry run, backups, restore, idempotency, conflict handling, missing folders, the running-app guard, sync's conflict and deletion rules, and the LaunchAgent commands (against a stand-in `launchctl`).
 
 ## License
 

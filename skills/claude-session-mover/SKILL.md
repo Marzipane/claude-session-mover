@@ -1,6 +1,6 @@
 ---
 name: claude-session-mover
-description: Install claude-session-mover and copy or move Claude Code sessions (chat history) from one Claude account to another on this machine, after a dry run the user confirms. Use when the user switched Claude accounts and wants old chats back, says "set up session moving", "move my sessions to this account", "restore my chats", or names claude-session-mover.
+description: Install claude-session-mover and copy or move Claude Code sessions (chat history) from one Claude account to another on this machine, after a dry run the user confirms, or set up automatic sync so every Claude Desktop account shows the same chats. Use when the user switched Claude accounts and wants old chats back, says "set up session moving", "move my sessions to this account", "restore my chats", "keep my chats in sync across accounts", or names claude-session-mover.
 ---
 
 # claude-session-mover
@@ -30,6 +30,16 @@ Moves session history between Claude accounts on one machine. Two stores:
      ```
      After the restart, read that log and show the user the result.
 7. **Report.** Show the `Done:` line, the backup name, and the undo command `claude-session-mover restore-backup <name>`. For Desktop, the moved chats appear after the app restarts.
+
+## Automatic sync (Claude Desktop on macOS)
+
+When the user wants every Desktop account to show the same chats from now on, or switches accounts often:
+
+1. Run `claude-session-mover sync --dry-run` and show the summary: how many files each folder gains, which chats would be moved to the trash because they were deleted in another account.
+2. After a clear yes, run `claude-session-mover install-agent`, then `claude-session-mover status` and show its result.
+3. Tell the user that chats from other accounts appear after a restart of Claude Desktop or an account switch.
+
+If chats are missing later, run `claude-session-mover status` first: it names a missing script, an unloaded agent or a failing run, and `install-agent` fixes the first two. `uninstall-agent` stops it.
 
 ## Rules
 

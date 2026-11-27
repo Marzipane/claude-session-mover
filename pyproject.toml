@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "claude-session-mover"
-version = "0.1.0"
+version = "0.2.0"
 description = "Copy or move Claude Code sessions (chat history) between Claude accounts, with dry runs and automatic backups."
 readme = "README.md"
 license = { text = "MIT" }

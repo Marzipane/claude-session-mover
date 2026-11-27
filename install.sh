@@ -2,7 +2,17 @@
 # Install claude-session-mover. Uses uv or pipx when present; otherwise drops the
 # single-file script into ~/.local/bin (override with CSM_BIN_DIR).
 #   curl -fsSL https://raw.githubusercontent.com/Marzipane/claude-session-mover/main/install.sh | sh
+# Add --auto-sync (macOS) to also install the agent that keeps every Claude Desktop account's chats in step:
+#   curl -fsSL https://raw.githubusercontent.com/Marzipane/claude-session-mover/main/install.sh | sh -s -- --auto-sync
 set -eu
+
+auto_sync=0
+for arg in "$@"; do
+  case "$arg" in
+    --auto-sync) auto_sync=1 ;;
+    *) echo "unknown option: $arg (the only option is --auto-sync)" >&2; exit 2 ;;
+  esac
+done
 
 REPO="https://github.com/Marzipane/claude-session-mover"
 REF="${CSM_REF:-main}"
@@ -32,3 +42,9 @@ else
 fi
 
 echo "Installed. Try: claude-session-mover list"
+
+if [ "$auto_sync" = 1 ]; then
+  csm="$(command -v claude-session-mover || true)"
+  [ -n "$csm" ] || csm="${CSM_BIN_DIR:-$HOME/.local/bin}/claude-session-mover"
+  "$csm" install-agent
+fi
