@@ -7,10 +7,21 @@ curl -fsSL https://raw.githubusercontent.com/Marzipane/claude-session-mover/main
 claude-session-mover list
 ```
 
-Or keep every Claude Desktop account showing the same chats, automatically (macOS):
+Windows (PowerShell):
+
+```powershell
+irm https://raw.githubusercontent.com/Marzipane/claude-session-mover/main/install.ps1 | iex
+claude-session-mover list
+```
+
+To also keep every Claude Desktop account showing the same chats automatically, add the sync agent:
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/Marzipane/claude-session-mover/main/install.sh | sh -s -- --auto-sync
+```
+
+```powershell
+$env:CSM_AUTO_SYNC = 1; irm https://raw.githubusercontent.com/Marzipane/claude-session-mover/main/install.ps1 | iex
 ```
 
 ## The problem
@@ -23,8 +34,8 @@ The tool handles two stores.
 
 | Store | Where | What one session is |
 |---|---|---|
-| `desktop` (Claude Desktop, Code tab) | macOS: `~/Library/Application Support/Claude/claude-code-sessions/<account>/<org>/` | `local_<id>.json`, an index entry with title, working directory, `lastActivityAt` and the CLI session id |
-| `cli` (Claude Code in a terminal) | `~/.claude`, or the folder `CLAUDE_CONFIG_DIR` points at | `projects/<encoded-working-dir>/<id>.jsonl` (the transcript), plus an optional `<id>/` folder (subagent transcripts, tool output) |
+| `desktop` (Claude Desktop, Code tab) | macOS: `~/Library/Application Support/Claude/claude-code-sessions/<account>/<org>/`; Windows: `%APPDATA%\Claude\claude-code-sessions\<account>\<org>\` | `local_<id>.json`, an index entry with title, working directory, `lastActivityAt` and the CLI session id |
+| `cli` (Claude Code in a terminal) | `~/.claude` (`%USERPROFILE%\.claude` on Windows), or the folder `CLAUDE_CONFIG_DIR` points at | `projects/<encoded-working-dir>/<id>.jsonl` (the transcript), plus an optional `<id>/` folder (subagent transcripts, tool output) |
 
 Claude Desktop shares one transcript folder (`~/.claude/projects`) across all its accounts. That means only the small index files need to move between Desktop accounts.
 
@@ -35,12 +46,14 @@ With the CLI, people usually keep one config dir per account (`CLAUDE_CONFIG_DIR
 | Way | Command |
 |---|---|
 | One-liner (uses uv or pipx if you have them, else drops one file into `~/.local/bin`) | `curl -fsSL https://raw.githubusercontent.com/Marzipane/claude-session-mover/main/install.sh \| sh` |
-| One-liner plus the auto-sync agent (macOS) | `curl -fsSL https://raw.githubusercontent.com/Marzipane/claude-session-mover/main/install.sh \| sh -s -- --auto-sync` |
+| One-liner plus the auto-sync agent | `curl -fsSL https://raw.githubusercontent.com/Marzipane/claude-session-mover/main/install.sh \| sh -s -- --auto-sync` |
+| Windows one-liner (PowerShell; uv or pipx if present, else `%LOCALAPPDATA%\claude-session-mover\bin` added to your PATH) | `irm https://raw.githubusercontent.com/Marzipane/claude-session-mover/main/install.ps1 \| iex` |
+| Windows one-liner plus the auto-sync agent | `$env:CSM_AUTO_SYNC = 1; irm https://raw.githubusercontent.com/Marzipane/claude-session-mover/main/install.ps1 \| iex` |
 | pipx | `pipx install git+https://github.com/Marzipane/claude-session-mover` |
 | uv | `uv tool install git+https://github.com/Marzipane/claude-session-mover` |
 | By hand | download `claude_session_mover.py`, `chmod +x`, put it on your `PATH` |
 
-Needs Python 3.8 or newer and nothing else (standard library only).
+Needs Python 3.8 or newer and nothing else (standard library only). Works on macOS, Windows and Linux (Linux has no Claude Desktop, so there only the `cli` store applies).
 
 ## Usage
 
@@ -78,16 +91,22 @@ What happens to each session:
 
 `move` removes a session from the source only after it is in the target, and never for skipped sessions.
 
-## Automatic sync between Claude Desktop accounts (macOS)
+## Automatic sync between Claude Desktop accounts (macOS and Windows)
 
 If you switch Claude Desktop accounts often, let the tool keep every account folder identical instead of copying by hand:
 
 ```bash
 claude-session-mover sync --dry-run     # what one sync would change
-claude-session-mover install-agent      # run sync every 20 s and whenever the folders change
+claude-session-mover install-agent      # run sync in the background (see below)
 claude-session-mover status             # is it installed, loaded and succeeding? (exit 1 when not)
 claude-session-mover uninstall-agent    # stop it and remove it
 ```
+
+| | macOS | Windows |
+|---|---|---|
+| Agent | LaunchAgent `io.github.marzipane.claude-session-mover.sync` in `~/Library/LaunchAgents` | Scheduled task `io.github.marzipane.claude-session-mover.sync`, hidden, as you, no admin rights |
+| How often | every 20 s and whenever an account folder changes | every minute (the shortest Task Scheduler repeat), via `pythonw` so no window opens |
+| Log, trash, backups | `~/.local/share/claude-session-mover/` | `%LOCALAPPDATA%\claude-session-mover\` |
 
 `sync` works on every `<account>/<org>` folder at once and copies every file in them (chat index files, `archived-sessions.idx`, scheduled tasks, waiting-input state), so archiving, renaming and scheduled tasks carry over too:
 
@@ -96,10 +115,10 @@ claude-session-mover uninstall-agent    # stop it and remove it
 | A file is missing in some folders | copied there, with its modification time |
 | Chat index files differ | the larger `lastActivityAt` wins, then the newer modification time |
 | Other files differ | the newer modification time wins |
-| A chat was deleted in any account (`deleted_<id>` marker) | moved out of every folder into `~/.local/share/claude-session-mover/removed/<date>/` (`--trash` to change), and the marker spreads |
+| A chat was deleted in any account (`deleted_<id>` marker) | moved out of every folder into `removed/<date>/` in the data folder above (`--trash` to change), and the marker spreads |
 | A chat index cannot be parsed (the app may be mid-save) | left alone until the next run |
 
-Unlike `copy` and `move`, `sync` runs while Claude Desktop is open and makes no per-run backup: it runs every 20 seconds, and the next run picks up whatever the app rewrites. Chats from another account show up in the sidebar after you restart the app or switch accounts, because Desktop reads its folder only then. The agent's log is `~/.local/share/claude-session-mover/sync.log`.
+Unlike `copy` and `move`, `sync` runs while Claude Desktop is open and makes no per-run backup: it runs every 20 seconds, and the next run picks up whatever the app rewrites. Chats from another account show up in the sidebar after you restart the app or switch accounts, because Desktop reads its folder only then. The agent's log is `sync.log` in the data folder above.
 
 Put `claude-session-mover status >/dev/null || echo "chat sync is broken"` in a shell profile or a Claude Code `SessionStart` hook to hear about it when the agent stops working (for example after the Python it was installed with is removed; `install-agent` again fixes that).
 
@@ -107,10 +126,11 @@ Put `claude-session-mover status >/dev/null || echo "chat sync is broken"` in a 
 
 | Flag | Environment variable | Default |
 |---|---|---|
-| `--desktop-root` | `CLAUDE_DESKTOP_SESSIONS_DIR` | macOS `~/Library/Application Support/Claude/claude-code-sessions`; Linux `$XDG_CONFIG_HOME/Claude/claude-code-sessions` |
+| `--desktop-root` | `CLAUDE_DESKTOP_SESSIONS_DIR` | macOS `~/Library/Application Support/Claude/claude-code-sessions`; Windows `%APPDATA%\Claude\claude-code-sessions`, or the Microsoft Store package's `%LOCALAPPDATA%\Packages\Claude_*\LocalCache\Roaming\Claude\claude-code-sessions` when that one holds the newer files; Linux `$XDG_CONFIG_HOME/Claude/claude-code-sessions` |
 | `list --config-dir` (repeatable) | `CLAUDE_CONFIG_DIR` | also finds `~/.claude`, `~/.claude-*`, `~/.config/claude*` |
-| `--backup-dir` | `CLAUDE_SESSION_MOVER_BACKUP_DIR` | `$XDG_DATA_HOME/claude-session-mover/backups` (`~/.local/share/...`) |
-| | `CLAUDE_SESSION_MOVER_APP_NAME` | `Claude`, the process name checked to see whether Claude Desktop runs |
+| `--backup-dir` | `CLAUDE_SESSION_MOVER_BACKUP_DIR` | `$XDG_DATA_HOME/claude-session-mover/backups` (`~/.local/share/...`); Windows `%LOCALAPPDATA%\claude-session-mover\backups` |
+| | `CLAUDE_SESSION_MOVER_APP_NAME` | `Claude`, the process name checked to see whether Claude Desktop runs (`Claude.exe` on Windows) |
+| | `CLAUDE_SESSION_MOVER_AGENT_NAME` | `io.github.marzipane.claude-session-mover.sync`, the agent's label or task name |
 
 ## Let Claude do it
 
@@ -139,13 +159,13 @@ Then tell Claude: *"Use claude-session-mover to set up session moving on this ma
 - **Dry run first.** `--dry-run` prints every path that would be written (`new` or `overwrite`) or removed, then exits without touching anything.
 - **Credentials are never touched.** Only `local_*.json` (Desktop) and `projects/` (CLI) are read or written; `sync` also copies the other app-state files inside the `claude-code-sessions/<account>/<org>/` folders, and nothing outside them. `.credentials.json`, `.claude.json`, the macOS keychain and settings files are never opened.
 - **Atomic writes.** Each file is written to a temporary file in the same folder and then renamed into place. Modification times are kept.
-- **Claude Desktop must be closed.** It rewrites its session index when it quits, which would undo a change made while it runs. On macOS the tool refuses to write Desktop folders while the app runs. `--wait-for-app-exit [SECONDS]` waits for you to quit it (default 600 s) and then writes. Reopen the app afterwards to see the chats.
+- **Claude Desktop must be closed.** It rewrites its session index when it quits, which would undo a change made while it runs. On macOS and Windows the tool refuses to write Desktop folders while the app runs. `--wait-for-app-exit [SECONDS]` waits for you to quit it (default 600 s) and then writes. Reopen the app afterwards to see the chats.
 - Backups contain copies of your session data. They stay on your machine with `0700` folder permissions. Delete old ones when you no longer need them.
 
 ## Limitations
 
-- **Windows is not supported.** It is untested, and the Desktop path and app check are macOS/Linux only.
-- **Linux Desktop path is unverified.** Claude Desktop has no official Linux build. The Linux default Desktop path is a best guess, so use `--desktop-root` if yours differs. The "is the app running" check only runs on macOS.
+- **The Windows Desktop path is not documented by Anthropic.** The default comes from user reports (`%APPDATA%\Claude\claude-code-sessions`, or the Store package's redirected copy). Run `claude-session-mover list` to see which folder it picked, and pass `--desktop-root` if yours differs. CI tests run on Windows against the real Task Scheduler, but not against a real Claude Desktop install.
+- **Linux Desktop path is unverified.** Claude Desktop has no official Linux build. The Linux default Desktop path is a best guess, so use `--desktop-root` if yours differs. The "is the app running" check runs only on macOS and Windows.
 - **Not migrated:** the CLI prompt history (`history.jsonl`), todos, settings, MCP config and Desktop's `archived-sessions.idx`. An archived Desktop chat keeps its `isArchived` flag in its own index file.
 - **Same-machine only.** For the `desktop` store, the transcripts must already be in the shared `~/.claude/projects`, which is true on the machine that created them. Moving to another computer is not supported.
 - **Undocumented formats.** Anthropic does not document these storage formats, and they may change. The tool only copies whole files and never edits their contents. Even so, run a dry run first after Claude updates.
@@ -156,7 +176,7 @@ Then tell Claude: *"Use claude-session-mover to set up session moving on this ma
 python3 -m unittest discover -s tests -v
 ```
 
-The tests build synthetic Desktop and CLI account folders in a temporary `HOME`. They cover list, copy, move, dry run, backups, restore, idempotency, conflict handling, missing folders, the running-app guard, sync's conflict and deletion rules, and the LaunchAgent commands (against a stand-in `launchctl`).
+The tests build synthetic Desktop and CLI account folders in a temporary `HOME`. They cover list, copy, move, dry run, backups, restore, idempotency, conflict handling, missing folders, the running-app guard, sync's conflict, deletion and locking rules, the macOS agent (against a stand-in `launchctl`), Windows Desktop folder detection, and the Windows agent against the real Task Scheduler (under a task name of their own). CI runs them on Ubuntu, macOS and Windows, and also runs both one-line installers from the branch being tested.
 
 ## License
 

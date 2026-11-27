@@ -11,6 +11,7 @@ import os
 import plistlib
 import sys
 import tempfile
+import time
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -26,6 +27,8 @@ PROJECT_TWO = "/home/dev/other-app"
 SESSION_1 = "11111111-1111-4111-8111-111111111111"
 SESSION_2 = "22222222-2222-4222-8222-222222222222"
 SESSION_3 = "33333333-3333-4333-8333-333333333333"
+# A process name that always runs, to stand in for Claude Desktop in the running-app checks.
+ALWAYS_RUNNING = {"darwin": "launchd", "win32": "svchost"}.get(sys.platform)
 
 
 def snapshot(root: Path) -> dict:
@@ -43,6 +46,9 @@ class Sandbox(unittest.TestCase):
         self.backups = self.home / "backups"
         env = {
             "HOME": str(self.home),
+            "USERPROFILE": str(self.home),  # Path.home() on Windows
+            "APPDATA": str(self.home / "AppData" / "Roaming"),
+            "LOCALAPPDATA": str(self.home / "AppData" / "Local"),
             "CLAUDE_DESKTOP_SESSIONS_DIR": str(self.desktop),
             "CLAUDE_SESSION_MOVER_BACKUP_DIR": str(self.backups),
             "CLAUDE_SESSION_MOVER_APP_NAME": "no-such-process-csm-test",
@@ -211,9 +217,9 @@ class DesktopTransferTests(Sandbox):
         self.assertEqual(code, 2)
         self.assertIn("--all, --project PATH or --session ID", err)
 
-    @unittest.skipUnless(sys.platform == "darwin", "the running-app check only exists on macOS")
+    @unittest.skipUnless(ALWAYS_RUNNING, "the running-app check exists on macOS and Windows")
     def test_refuses_to_write_while_the_desktop_app_runs(self):
-        os.environ["CLAUDE_SESSION_MOVER_APP_NAME"] = "launchd"
+        os.environ["CLAUDE_SESSION_MOVER_APP_NAME"] = ALWAYS_RUNNING
         before = snapshot(self.desktop)
 
         code, _, err = self.run_cli("copy", "--from", "aaaa", "--to", "bbbb", "--all")
@@ -222,9 +228,9 @@ class DesktopTransferTests(Sandbox):
         self.assertIn("Claude Desktop is running", err)
         self.assertEqual(snapshot(self.desktop), before)
 
-    @unittest.skipUnless(sys.platform == "darwin", "the running-app check only exists on macOS")
+    @unittest.skipUnless(ALWAYS_RUNNING, "the running-app check exists on macOS and Windows")
     def test_waiting_for_the_app_gives_up_after_the_timeout(self):
-        os.environ["CLAUDE_SESSION_MOVER_APP_NAME"] = "launchd"
+        os.environ["CLAUDE_SESSION_MOVER_APP_NAME"] = ALWAYS_RUNNING
         before = snapshot(self.desktop)
 
         code, _, err = self.run_cli("copy", "--from", "aaaa", "--to", "bbbb", "--all", "--wait-for-app-exit", "1")
@@ -422,6 +428,31 @@ class SyncTests(Sandbox):
         code, out, _ = self.sync("--quiet")
         self.assertEqual(out, "")
 
+    def test_a_second_sync_while_one_runs_does_nothing(self):
+        self.desktop_chat(ACCOUNT_A, SESSION_1, PROJECT_ONE, 1_700_000_000_000)
+        before = snapshot(self.desktop)
+
+        with csm.sync_lock(self.desktop) as held:
+            self.assertTrue(held)
+            code, out, _ = self.sync()
+
+        self.assertEqual((code, out), (0, ""))
+        self.assertEqual(snapshot(self.desktop), before)
+
+    def test_log_appends_output_and_records_a_failure_with_exit_code_1(self):
+        self.desktop_chat(ACCOUNT_A, SESSION_1, PROJECT_ONE, 1_700_000_000_000)
+        log = self.home / "logs" / "sync.log"
+
+        code, out, _ = self.sync("--log", str(log))
+        self.assertEqual((code, out), (0, ""))
+        self.assertIn(f"add local_{SESSION_1}.json (2 folders)", log.read_text())
+
+        (self.folders[0] / f"deleted_{SESSION_1}").write_text("")
+        self.trash.write_text("a file where the trash folder should be")
+        code, _, _ = self.sync("--log", str(log))
+        self.assertEqual(code, 1)
+        self.assertIn("Traceback", log.read_text())
+
 
 FAKE_LAUNCHCTL = """#!/bin/sh
 # Stands in for launchctl: logs every call; 'print' succeeds only while the job is bootstrapped.
@@ -435,7 +466,7 @@ esac
 
 
 @unittest.skipUnless(sys.platform == "darwin", "the sync agent is a macOS LaunchAgent")
-class AgentTests(Sandbox):
+class MacAgentTests(Sandbox):
     def setUp(self):
         super().setUp()
         self.desktop_account(ACCOUNT_A)
@@ -450,7 +481,7 @@ class AgentTests(Sandbox):
             "FAKE_LAUNCHCTL_LOG": str(self.calls),
             "FAKE_LAUNCHCTL_STATE": str(self.state),
         })
-        self.plist = self.home / "Library" / "LaunchAgents" / f"{csm.AGENT_LABEL}.plist"
+        self.plist = self.home / "Library" / "LaunchAgents" / f"{csm.agent_name()}.plist"
 
     def launchctl_calls(self):
         return self.calls.read_text().splitlines() if self.calls.exists() else []
@@ -461,7 +492,7 @@ class AgentTests(Sandbox):
         self.assertEqual(code, 0, err)
         with self.plist.open("rb") as f:
             agent = plistlib.load(f)
-        self.assertEqual(agent["Label"], csm.AGENT_LABEL)
+        self.assertEqual(agent["Label"], csm.agent_name())
         self.assertEqual(agent["ProgramArguments"][2:], [
             str(Path(csm.__file__).resolve()), "sync", "--quiet", "--desktop-root", str(self.desktop)])
         self.assertEqual(agent["StartInterval"], 20)
@@ -507,10 +538,93 @@ class AgentTests(Sandbox):
 
         self.assertEqual(code, 0, out)
         self.assertFalse(self.plist.exists())
-        self.assertIn(f"bootout gui/{os.getuid()}/{csm.AGENT_LABEL}", self.launchctl_calls())
+        self.assertIn(f"bootout gui/{os.getuid()}/{csm.agent_name()}", self.launchctl_calls())
         code, out, _ = self.run_cli("status")
         self.assertEqual(code, 1)
         self.assertIn("not installed", out)
+
+
+@unittest.skipUnless(sys.platform == "win32", "Windows only")
+class WindowsDesktopRootTests(Sandbox):
+    def setUp(self):
+        super().setUp()
+        os.environ.pop("CLAUDE_DESKTOP_SESSIONS_DIR")
+        self.roaming = self.home / "AppData" / "Roaming" / "Claude" / "claude-code-sessions"
+        self.packaged = (self.home / "AppData" / "Local" / "Packages" / "Claude_test123" / "LocalCache"
+                         / "Roaming" / "Claude" / "claude-code-sessions")
+
+    def chat_in(self, root: Path, mtime: int) -> None:
+        folder = root / ACCOUNT_A / ORG
+        folder.mkdir(parents=True)
+        chat = folder / f"local_{SESSION_1}.json"
+        chat.write_text("{}")
+        os.utime(chat, (mtime, mtime))
+
+    def listed_root(self) -> str:
+        _, out, _ = self.run_cli("list", "--store", "desktop")
+        return out.splitlines()[0]
+
+    def test_defaults_to_appdata_roaming(self):
+        self.assertEqual(self.listed_root(), f"Claude Desktop accounts  ({self.roaming})")
+
+    def test_uses_the_store_package_folder_when_only_it_exists(self):
+        self.chat_in(self.packaged, 1_700_000_000)
+        self.assertEqual(self.listed_root(), f"Claude Desktop accounts  ({self.packaged})")
+
+    def test_picks_the_folder_with_the_newest_file_when_both_exist(self):
+        self.chat_in(self.roaming, 1_700_000_000)
+        self.chat_in(self.packaged, 1_600_000_000)
+        self.assertEqual(self.listed_root(), f"Claude Desktop accounts  ({self.roaming})")
+
+
+@unittest.skipUnless(sys.platform == "win32", "the sync agent is a scheduled task on Windows")
+class WindowsAgentTests(Sandbox):
+    """Against the real Task Scheduler, under a task name of their own."""
+
+    def setUp(self):
+        super().setUp()
+        os.environ["CLAUDE_SESSION_MOVER_AGENT_NAME"] = f"csm-test-{os.getpid()}-{id(self)}"
+        self.addCleanup(csm._powershell,
+                        f"Unregister-ScheduledTask -TaskName '{csm.agent_name()}' -Confirm:$false "
+                        "-ErrorAction SilentlyContinue")
+        self.chat = self.desktop_chat(ACCOUNT_A, SESSION_1, PROJECT_ONE, 1_700_000_000_000)
+        self.other = self.desktop_account(ACCOUNT_B)
+
+    def wait_for(self, condition, seconds=90):
+        deadline = time.monotonic() + seconds
+        while time.monotonic() < deadline:
+            if condition():
+                return
+            time.sleep(1)
+        self.fail(f"gave up after {seconds} s; status says: {self.run_cli('status')[1]}")
+
+    def test_install_runs_sync_hidden_and_status_reports_healthy(self):
+        code, out, err = self.run_cli("install-agent")
+        self.assertEqual(code, 0, err)
+
+        self.wait_for(lambda: (self.other / self.chat.name).exists())
+        self.wait_for(lambda: self.run_cli("status")[0] == 0)
+        state = csm.agent_state()
+        self.assertTrue(state.defined and state.loaded)
+        self.assertEqual(state.script, Path(csm.__file__).resolve())
+        self.assertIn(f"add {self.chat.name} (1 folder)", (self.home / "AppData" / "Local" / csm.PROG
+                                                           / "sync.log").read_text())
+
+    def test_status_reports_a_failing_run_and_uninstall_removes_the_task(self):
+        self.run_cli("install-agent")
+        csm._powershell(f"Set-ScheduledTask -TaskName '{csm.agent_name()}' "
+                        "-Action (New-ScheduledTaskAction -Execute 'cmd.exe' -Argument '/c exit 2') | Out-Null; "
+                        f"Start-ScheduledTask -TaskName '{csm.agent_name()}'")
+
+        self.wait_for(lambda: "last run failed (exit code 2)" in self.run_cli("status")[1])
+
+        code, out, _ = self.run_cli("uninstall-agent")
+        self.assertEqual(code, 0)
+        self.assertIn("Removed", out)
+        code, out, _ = self.run_cli("status")
+        self.assertEqual(code, 1)
+        self.assertIn("not installed", out)
+        self.assertIn("was not installed", self.run_cli("uninstall-agent")[1])
 
 
 class BackupAndRestoreTests(Sandbox):

@@ -5,9 +5,73 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, macos-latest]
+        os: [ubuntu-latest, macos-latest, windows-latest]
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
-      - run: python3 --version
-      - run: python3 -m unittest discover -s tests -v
+      # Each runner's own Python: setup-python has no build for some new runner images.
+      - name: Unit tests
+        shell: bash
+        run: |
+          if [ "$RUNNER_OS" = Windows ]; then PY=python; else PY=python3; fi
+          $PY --version
+          $PY -m unittest discover -s tests -v
+
+  # The one-line installers, fetched from GitHub at the commit being tested, as a user would run them.
+  install-unix:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    env:
+      CSM_REF: ${{ github.sha }}
+      CLAUDE_SESSION_MOVER_AGENT_NAME: csm-ci-${{ github.run_id }}
+    steps:
+      - name: curl | sh
+        run: |
+          curl -fsSL "https://raw.githubusercontent.com/Marzipane/claude-session-mover/$CSM_REF/install.sh" | sh
+          export PATH="$HOME/.local/bin:$PATH"
+          claude-session-mover --version
+          claude-session-mover list
+      - name: curl | sh -s -- --auto-sync (macOS)
+        if: runner.os == 'macOS'
+        run: |
+          mkdir -p "$HOME/Library/Application Support/Claude/claude-code-sessions/acct/org"
+          curl -fsSL "https://raw.githubusercontent.com/Marzipane/claude-session-mover/$CSM_REF/install.sh" | sh -s -- --auto-sync
+          export PATH="$HOME/.local/bin:$PATH"
+          for i in $(seq 1 30); do claude-session-mover status && break; sleep 2; done
+          claude-session-mover status
+          claude-session-mover uninstall-agent
+
+  install-windows:
+    strategy:
+      fail-fast: false
+      matrix:
+        method: [package-manager, single-file]
+    runs-on: windows-latest
+    env:
+      CSM_REF: ${{ github.sha }}
+      CLAUDE_SESSION_MOVER_AGENT_NAME: csm-ci-${{ github.run_id }}-${{ matrix.method }}
+    defaults:
+      run:
+        shell: powershell  # Windows PowerShell 5.1, which every Windows has
+    steps:
+      - name: irm | iex, with the auto-sync agent
+        run: |
+          if ('${{ matrix.method }}' -eq 'single-file') {
+            # Hide uv and pipx so the installer takes its no-package-manager path.
+            $env:Path = ($env:Path -split ';' | Where-Object {
+              $_ -and -not (Test-Path (Join-Path $_ 'pipx.exe')) -and -not (Test-Path (Join-Path $_ 'uv.exe'))
+            }) -join ';'
+          }
+          New-Item -ItemType Directory -Force -Path "$env:APPDATA\Claude\claude-code-sessions\acct\org" | Out-Null
+          $env:CSM_AUTO_SYNC = 1
+          irm "https://raw.githubusercontent.com/Marzipane/claude-session-mover/$env:CSM_REF/install.ps1" | iex
+          claude-session-mover --version
+          if ($LASTEXITCODE -ne 0) { exit 1 }
+          for ($i = 0; $i -lt 45; $i++) { claude-session-mover status; if ($LASTEXITCODE -eq 0) { break }; Start-Sleep 2 }
+          claude-session-mover status
+          if ($LASTEXITCODE -ne 0) { exit 1 }
+          claude-session-mover uninstall-agent
+          if ($LASTEXITCODE -ne 0) { exit 1 }

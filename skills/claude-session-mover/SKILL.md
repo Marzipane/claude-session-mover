@@ -12,9 +12,10 @@ Moves session history between Claude accounts on one machine. Two stores:
 
 ## Steps
 
-1. **Install if missing.** Run `claude-session-mover --version`. If it is not found, run:
+1. **Install if missing.** Run `claude-session-mover --version`. If it is not found, run on macOS/Linux:
    `curl -fsSL https://raw.githubusercontent.com/Marzipane/claude-session-mover/main/install.sh | sh`
-   then check `--version` again (it may live in `~/.local/bin`).
+   or on Windows (PowerShell): `irm https://raw.githubusercontent.com/Marzipane/claude-session-mover/main/install.ps1 | iex`
+   then check `--version` again (it may live in `~/.local/bin` or `%LOCALAPPDATA%\claude-session-mover\bin`).
 2. **Detect accounts.** Run `claude-session-mover list`. Show the user the accounts, their session counts and newest activity.
    - Running inside Claude Desktop, the current account is in this session's working directory path: `.../scratch-workspaces/<account>/<org>/...`. Otherwise, the folder with the newest activity is usually the one in use.
    - Only one CLI config dir and one Desktop folder means there is nothing to move: say so and stop.
@@ -28,15 +29,20 @@ Moves session history between Claude accounts on one machine. Two stores:
      nohup claude-session-mover copy --from SRC --to DST --all --wait-for-app-exit 900 \
        > "$HOME/claude-session-mover-last-run.log" 2>&1 & disown
      ```
+     On Windows, start the waiter with PowerShell instead:
+     ```powershell
+     Start-Process -WindowStyle Hidden claude-session-mover -ArgumentList 'copy','--from','SRC','--to','DST','--all','--wait-for-app-exit','900' `
+       -RedirectStandardOutput "$HOME\claude-session-mover-last-run.log"
+     ```
      After the restart, read that log and show the user the result.
 7. **Report.** Show the `Done:` line, the backup name, and the undo command `claude-session-mover restore-backup <name>`. For Desktop, the moved chats appear after the app restarts.
 
-## Automatic sync (Claude Desktop on macOS)
+## Automatic sync (Claude Desktop on macOS and Windows)
 
 When the user wants every Desktop account to show the same chats from now on, or switches accounts often:
 
 1. Run `claude-session-mover sync --dry-run` and show the summary: how many files each folder gains, which chats would be moved to the trash because they were deleted in another account.
-2. After a clear yes, run `claude-session-mover install-agent`, then `claude-session-mover status` and show its result.
+2. After a clear yes, run `claude-session-mover install-agent`, then `claude-session-mover status` and show its result. It is a LaunchAgent on macOS (every 20 s) and a hidden scheduled task on Windows (every minute); neither needs admin rights.
 3. Tell the user that chats from other accounts appear after a restart of Claude Desktop or an account switch.
 
 If chats are missing later, run `claude-session-mover status` first: it names a missing script, an unloaded agent or a failing run, and `install-agent` fixes the first two. `uninstall-agent` stops it.

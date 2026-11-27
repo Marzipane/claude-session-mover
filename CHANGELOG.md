@@ -8,9 +8,14 @@ All notable changes to this project are documented here. The format follows
 
 ### Added
 - `sync`: makes every Claude Desktop account folder hold the newest copy of every file, so each account shows the same chats. Chat index files: larger `lastActivityAt` wins, then the newer mtime; other files: newer mtime wins; a `deleted_<id>` marker moves that chat out of every folder into a trash folder. Idempotent, locked per root, `--dry-run` and `--quiet`.
-- `install-agent` / `uninstall-agent` (macOS): run `sync` as a LaunchAgent every 20 s and whenever the account folders change.
-- `status` (macOS): reports whether the agent is installed, loaded and succeeding, and how many changes are pending; exits 1 when it is not healthy, for use in hooks and scripts.
+- `install-agent` / `uninstall-agent`: run `sync` in the background: a LaunchAgent on macOS (every 20 s and whenever the account folders change), a hidden scheduled task on Windows (every minute, no admin rights).
+- `status`: reports whether the agent is installed, loaded and succeeding, and how many changes are pending; exits 1 when it is not healthy, for use in hooks and scripts.
 - Installer flag `--auto-sync`: `curl ... | sh -s -- --auto-sync` installs the tool and the agent.
+- Windows support: `install.ps1` one-line installer (`irm ... | iex`, `CSM_AUTO_SYNC=1` for the agent), the Desktop folder under `%APPDATA%` or the Microsoft Store package, the running-app check via `tasklist`, data under `%LOCALAPPDATA%\claude-session-mover`, and retries when Windows reports a file in use.
+- `sync --log FILE` for agents that have no console.
+
+### Changed
+- Backups, the sync trash and the agent log live in one data folder: `$XDG_DATA_HOME/claude-session-mover` (unchanged) or `%LOCALAPPDATA%\claude-session-mover` on Windows.
 
 ## [0.1.0] - 2026-11-23
 
