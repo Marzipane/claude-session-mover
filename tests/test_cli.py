@@ -435,6 +435,21 @@ class SyncTests(Sandbox):
         code, out, _ = self.sync("--quiet")
         self.assertEqual(out, "")
 
+    def test_a_file_that_vanishes_mid_scan_is_skipped(self):
+        """The agent's own temp files and the app's saves come and go while another command scans."""
+        self.desktop_chat(ACCOUNT_A, SESSION_1, PROJECT_ONE, 1_700_000_000_000)
+        real_walk = os.walk
+
+        def walk_listing_a_ghost(top, *args, **kwargs):
+            for dirpath, dirnames, filenames in real_walk(top, *args, **kwargs):
+                yield dirpath, dirnames, filenames + [f"local_{SESSION_3}.json"]
+
+        with mock.patch.object(csm.os, "walk", walk_listing_a_ghost):
+            code, out, err = self.sync("--dry-run")
+
+        self.assertEqual(code, 0, err)
+        self.assertIn(f"would add local_{SESSION_1}.json (2 folders)", out)
+
     def test_a_second_sync_while_one_runs_does_nothing(self):
         self.desktop_chat(ACCOUNT_A, SESSION_1, PROJECT_ONE, 1_700_000_000_000)
         before = snapshot(self.desktop)
@@ -577,6 +592,19 @@ class WindowsDesktopRootTests(Sandbox):
     def test_uses_the_store_package_folder_when_only_it_exists(self):
         self.chat_in(self.packaged, 1_700_000_000)
         self.assertEqual(self.listed_root(), f"Claude Desktop accounts  ({self.packaged})")
+
+    def test_a_file_that_vanishes_while_picking_the_folder_is_skipped(self):
+        self.chat_in(self.roaming, 1_700_000_000)
+        self.chat_in(self.packaged, 1_600_000_000)
+        real_rglob = Path.rglob
+
+        def rglob_listing_a_ghost(path, pattern):
+            yield from real_rglob(path, pattern)
+            yield path / ".csm-gone"
+            yield path / "gone.json"
+
+        with mock.patch.object(Path, "rglob", rglob_listing_a_ghost):
+            self.assertEqual(self.listed_root(), f"Claude Desktop accounts  ({self.roaming})")
 
     def test_picks_the_folder_with_the_newest_file_when_both_exist(self):
         self.chat_in(self.roaming, 1_700_000_000)

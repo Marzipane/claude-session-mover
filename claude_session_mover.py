@@ -36,7 +36,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, Iterator, List, Optional, Sequence, Set, Tuple
 
-__version__ = "0.2.0"
+__version__ = "0.2.1"
 PROG = "claude-session-mover"
 MANIFEST = "manifest.json"
 MIN_ID_PREFIX = 4
@@ -129,7 +129,17 @@ def _windows_desktop_root(home: Path) -> Path:
 
 
 def _newest_mtime(root: Path) -> float:
-    return max((p.stat().st_mtime for p in root.rglob("*") if p.is_file()), default=0.0)
+    newest = 0.0
+    for path in root.rglob("*"):
+        if path.name.startswith("."):  # sync's own temp files: written and renamed away within milliseconds
+            continue
+        try:
+            st = path.stat()
+        except FileNotFoundError:  # removed since it was listed, by a sync or by the app saving
+            continue
+        if stat.S_ISREG(st.st_mode):
+            newest = max(newest, st.st_mtime)
+    return newest
 
 
 def _subdirs(path: Path) -> List[Path]:
@@ -568,7 +578,10 @@ def _sync_inventory(folders: Sequence[Path]) -> Dict[str, Dict[Path, os.stat_res
                 if name.startswith("."):
                     continue
                 path = Path(dirpath) / name
-                st = path.lstat()
+                try:
+                    st = path.lstat()
+                except FileNotFoundError:  # removed since it was listed; the next run sees the new state
+                    continue
                 if stat.S_ISREG(st.st_mode):
                     found.setdefault(path.relative_to(folder).as_posix(), {})[folder] = st
     return found
