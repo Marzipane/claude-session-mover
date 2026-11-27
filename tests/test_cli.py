@@ -120,6 +120,13 @@ class ListTests(Sandbox):
         self.assertIn(str(work), out)
         self.assertIn(SESSION_1, out)
 
+    def test_every_command_has_working_help(self):
+        commands = ["list", "copy", "move", "restore-backup", "sync", "install-agent", "uninstall-agent", "status"]
+        for command in [[]] + [[c] for c in commands]:
+            with self.subTest(command=command), self.assertRaises(SystemExit) as exited:
+                self.run_cli(*command, "--help")
+            self.assertEqual(exited.exception.code, 0)
+
     def test_missing_dirs_are_reported_not_crashed_on(self):
         code, out, _ = self.run_cli("list")
         self.assertEqual(code, 0)

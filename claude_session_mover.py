@@ -1171,7 +1171,7 @@ def build_parser() -> argparse.ArgumentParser:
     common.add_argument("--backup-dir", type=Path, default=None,
                         help="where backups go (env CLAUDE_SESSION_MOVER_BACKUP_DIR; "
                              "default: ~/.local/share/claude-session-mover/backups, "
-                             "%LOCALAPPDATA%\\claude-session-mover\\backups on Windows)")
+                             "%%LOCALAPPDATA%%\\claude-session-mover\\backups on Windows)")
 
     parser = argparse.ArgumentParser(prog=PROG, description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--version", action="version", version=f"{PROG} {__version__}")

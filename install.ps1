@@ -45,7 +45,7 @@ if (Get-Command uv -ErrorAction SilentlyContinue) {
     $script = Join-Path $bin 'claude_session_mover.py'
     $download = "$script.download"
     Invoke-WebRequest -UseBasicParsing -Uri $Raw -OutFile $download -TimeoutSec 60
-    Invoke-Checked 'checking the download' { & $python -c 'import ast, sys; ast.parse(open(sys.argv[1], encoding="utf-8").read())' $download }
+    Invoke-Checked 'checking the download' { & $python -c 'import ast, sys; ast.parse(open(sys.argv[1], ''rb'').read())' $download }
     Move-Item -Force $download $script
     Set-Content -Encoding ASCII -Path (Join-Path $bin 'claude-session-mover.cmd') -Value "@`"$python`" `"%~dp0claude_session_mover.py`" %*"
     $userPath = [Environment]::GetEnvironmentVariable('Path', 'User')
