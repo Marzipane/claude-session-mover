@@ -4,6 +4,11 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and versions follow
 [Semantic Versioning](https://semver.org/).
 
+## [0.2.1] - 2026-11-27
+
+### Fixed
+- Commands could crash with `FileNotFoundError` while the sync agent was running: a file listed during a folder scan could be gone (a temp file renamed into place, or a chat moved to the trash) before it was read. Seen on Windows, where every command scans the Desktop folder to pick it. Files that vanish mid-scan are now skipped.
+
 ## [0.2.0] - 2026-11-27
 
 ### Added
@@ -29,5 +34,6 @@ All notable changes to this project are documented here. The format follows
 - Refuses to write Desktop folders while Claude Desktop runs; `--wait-for-app-exit` waits for it to quit.
 - Claude Code skill and plugin marketplace entry, and a one-line installer.
 
+[0.2.1]: https://github.com/Marzipane/claude-session-mover/releases/tag/v0.2.1
 [0.2.0]: https://github.com/Marzipane/claude-session-mover/releases/tag/v0.2.0
 [0.1.0]: https://github.com/Marzipane/claude-session-mover/releases/tag/v0.1.0
