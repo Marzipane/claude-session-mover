@@ -1,6 +1,6 @@
 {
   "name": "claude-session-mover",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Install claude-session-mover and move Claude Code sessions between accounts on this machine, with a dry run and your confirmation first",
   "author": { "name": "Marzipane" },
   "homepage": "https://github.com/Marzipane/claude-session-mover",

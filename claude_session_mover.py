@@ -11,24 +11,32 @@ Two places hold sessions, and this tool calls each one a *store*:
            points at). Each keeps its transcripts in projects/<project>/<id>.jsonl.
 
 Only session files are read or written. Credentials (.credentials.json,
-.claude.json, the keychain) are never opened.
+.claude.json, the keychain) are never opened. `sync` and its macOS LaunchAgent
+(`install-agent`) keep every Desktop account folder identical automatically.
 """
 from __future__ import annotations
 
 import argparse
+import contextlib
+import csv
+import hashlib
 import json
 import os
+import plistlib
+import random
 import re
 import shutil
+import stat
 import subprocess
 import sys
 import tempfile
 import time
+import traceback
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, List, Optional, Sequence, Set, Tuple
+from typing import Dict, Iterator, List, Optional, Sequence, Set, Tuple
 
-__version__ = "0.1.0"
+__version__ = "0.2.0"
 PROG = "claude-session-mover"
 MANIFEST = "manifest.json"
 MIN_ID_PREFIX = 4
@@ -100,8 +108,28 @@ def default_desktop_root() -> Path:
     home = Path.home()
     if sys.platform == "darwin":
         return home / "Library" / "Application Support" / "Claude" / "claude-code-sessions"
+    if sys.platform == "win32":
+        return _windows_desktop_root(home)
     config_home = Path(os.environ.get("XDG_CONFIG_HOME") or home / ".config")
     return config_home / "Claude" / "claude-code-sessions"
+
+
+def _windows_desktop_root(home: Path) -> Path:
+    """%APPDATA%\\Claude\\claude-code-sessions, or the Microsoft Store (MSIX) package's redirected copy of it.
+
+    Not documented by Anthropic; taken from user reports. When both exist, the one with the newest
+    file is the one the app is using.
+    """
+    appdata = Path(os.environ.get("APPDATA") or home / "AppData" / "Roaming")
+    local = Path(os.environ.get("LOCALAPPDATA") or home / "AppData" / "Local")
+    candidates = [appdata / "Claude" / "claude-code-sessions"]
+    candidates += sorted((local / "Packages").glob("Claude_*/LocalCache/Roaming/Claude/claude-code-sessions"))
+    existing = [c for c in candidates if c.is_dir()]
+    return max(existing, key=_newest_mtime) if existing else candidates[0]
+
+
+def _newest_mtime(root: Path) -> float:
+    return max((p.stat().st_mtime for p in root.rglob("*") if p.is_file()), default=0.0)
 
 
 def _subdirs(path: Path) -> List[Path]:
@@ -222,7 +250,8 @@ def resolve_location(value: str, desktop_root: Path) -> Location:
             if location.root.resolve() == path.resolve():
                 return location
         return Location("cli", path, str(path))
-    if value.startswith(("/", "~", ".")):
+    # A Desktop account is named "<account>/<org>", so a "/" alone does not make a path; a drive or "\\" does.
+    if value.startswith(("/", "~", ".")) or os.path.isabs(value) or (sys.platform == "win32" and "\\" in value):
         raise UsageError(f"folder not found: {value}")
     return _desktop_location_by_prefix(value, desktop_root)
 
@@ -350,12 +379,18 @@ def plan_transfer(source: Location, target: Location, sessions: List[Session], m
 # --------------------------------------------------------------------------- applying, with backup
 
 
+def default_data_dir() -> Path:
+    """Backups, the sync trash, locks and the agent log: %LOCALAPPDATA% on Windows, XDG data home elsewhere."""
+    if sys.platform == "win32":
+        return Path(os.environ.get("LOCALAPPDATA") or Path.home() / "AppData" / "Local") / PROG
+    return Path(os.environ.get("XDG_DATA_HOME") or Path.home() / ".local" / "share") / PROG
+
+
 def default_backup_root() -> Path:
     configured = os.environ.get("CLAUDE_SESSION_MOVER_BACKUP_DIR")
     if configured:
         return Path(configured).expanduser()
-    data_home = Path(os.environ.get("XDG_DATA_HOME") or Path.home() / ".local" / "share")
-    return data_home / PROG / "backups"
+    return default_data_dir() / "backups"
 
 
 def _new_backup_dir(backup_root: Path, command: str) -> Path:
@@ -376,11 +411,23 @@ def _atomic_copy(source: Path, destination: Path) -> None:
     os.close(fd)
     try:
         shutil.copy2(source, tmp)
-        os.replace(tmp, destination)
+        _replace(tmp, destination)
     except BaseException:
         if os.path.exists(tmp):
             os.unlink(tmp)
         raise
+
+
+def _replace(tmp: str, destination: Path, attempts: int = 5) -> None:
+    """os.replace, retried with backoff and jitter while Windows reports the destination as in use."""
+    for attempt in range(attempts):
+        try:
+            os.replace(tmp, destination)
+            return
+        except PermissionError:
+            if attempt == attempts - 1:
+                raise
+            time.sleep(0.05 * 2 ** attempt * (0.5 + random.random()))
 
 
 def _missing_parents(path: Path) -> List[Path]:
@@ -494,14 +541,391 @@ def remove_created_dirs(backup: Path) -> List[str]:
     return removed
 
 
+# --------------------------------------------------------------------------- sync (every Desktop account alike)
+
+
+@dataclass(frozen=True)
+class SyncOp:
+    """`add`/`update` copy `source` to `path`; `remove` moves the chat at `path` into the trash."""
+
+    kind: str
+    rel: str
+    path: Path
+    source: Optional[Path] = None
+
+
+def _is_chat_index(rel: str) -> bool:
+    return "/" not in rel and rel.startswith("local_") and rel.endswith(".json")
+
+
+def _sync_inventory(folders: Sequence[Path]) -> Dict[str, Dict[Path, os.stat_result]]:
+    """Relative path -> {folder: stat} for every regular, non-hidden file in every account folder."""
+    found: Dict[str, Dict[Path, os.stat_result]] = {}
+    for folder in folders:
+        for dirpath, dirnames, filenames in os.walk(folder):
+            dirnames[:] = [d for d in dirnames if not d.startswith(".")]
+            for name in filenames:
+                if name.startswith("."):
+                    continue
+                path = Path(dirpath) / name
+                st = path.lstat()
+                if stat.S_ISREG(st.st_mode):
+                    found.setdefault(path.relative_to(folder).as_posix(), {})[folder] = st
+    return found
+
+
+def _sync_version(path: Path, rel: str, st: os.stat_result) -> Optional[Tuple[float, int]]:
+    """Sort key for 'which copy is newest'; None while a chat index cannot be parsed (Claude may be mid-save)."""
+    if not _is_chat_index(rel):
+        return (0, st.st_mtime_ns)
+    try:
+        index = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    return (index.get("lastActivityAt") or 0, st.st_mtime_ns)
+
+
+def plan_sync(root: Path) -> Tuple[List[Path], List[SyncOp]]:
+    """The account folders under `root` and the ops that make every one hold the newest copy of every file."""
+    folders = [location.root for location in desktop_locations(root)]
+    files = _sync_inventory(folders)
+    deleted = {rel[len("deleted_"):] for rel in files if "/" not in rel and rel.startswith("deleted_")}
+    ops: List[SyncOp] = []
+    for rel, where in sorted(files.items()):
+        if _is_chat_index(rel) and rel[len("local_"):-len(".json")] in deleted:
+            ops += [SyncOp("remove", rel, folder / rel) for folder in where]
+            continue
+        if len(where) == len(folders) and len({(st.st_size, st.st_mtime_ns) for st in where.values()}) == 1:
+            continue
+        versions = {folder: _sync_version(folder / rel, rel, st) for folder, st in where.items()}
+        if any(v is None for v in versions.values()):
+            continue
+        newest = max(where, key=lambda folder: versions[folder])
+        for folder in folders:
+            if folder == newest:
+                continue
+            if folder not in where:
+                ops.append(SyncOp("add", rel, folder / rel, newest / rel))
+            elif versions[folder] < versions[newest]:
+                ops.append(SyncOp("update", rel, folder / rel, newest / rel))
+    return folders, ops
+
+
+def apply_sync(ops: Sequence[SyncOp], root: Path, trash: Path) -> None:
+    day = trash / time.strftime("%Y%m%d")
+    for op in ops:
+        if op.kind == "remove":
+            if op.path.exists():
+                aside = day / op.path.relative_to(root)
+                aside.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+                shutil.move(str(op.path), str(aside))
+            continue
+        assert op.source is not None
+        op.path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+        _atomic_copy(op.source, op.path)
+
+
+def sync_summary(ops: Sequence[SyncOp]) -> List[str]:
+    counts: Dict[Tuple[str, str], int] = {}
+    for op in ops:
+        counts[(op.kind, op.rel)] = counts.get((op.kind, op.rel), 0) + 1
+    return [f"{kind} {rel} ({n} folder{'s' if n > 1 else ''})" for (kind, rel), n in sorted(counts.items())]
+
+
+
+
+@contextlib.contextmanager
+def sync_lock(root: Path) -> Iterator[bool]:
+    """Yield True when this process holds the lock for `root`, False when another sync already runs."""
+    locks = default_data_dir() / "locks"
+    locks.mkdir(parents=True, exist_ok=True, mode=0o700)
+    key = hashlib.sha1(str(root.resolve()).encode()).hexdigest()[:10]
+    with (locks / f"sync-{key}.lock").open("a+") as lock:
+        yield _try_lock(lock)
+
+
+def _try_lock(handle) -> bool:
+    """Take an exclusive lock on an open file without waiting; the OS releases it when the file closes."""
+    if sys.platform == "win32":
+        import msvcrt
+
+        try:
+            msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
+        except OSError:
+            return False
+        return True
+    import fcntl
+
+    try:
+        fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        return False
+    return True
+
+
+# --------------------------------------------------------------------------- the sync agent
+# macOS: a LaunchAgent run by launchd. Windows: a scheduled task run by Task Scheduler.
+
+DEFAULT_AGENT_NAME = "io.github.marzipane.claude-session-mover.sync"
+# Task Scheduler cannot repeat a task more often than once a minute.
+AGENT_INTERVAL_SECONDS = {"darwin": 20, "win32": 60}
+TASK_NEVER_RAN, TASK_RUNNING = 0x41303, 0x41301
+
+
+@dataclass(frozen=True)
+class AgentState:
+    """What the OS reports about the agent. `last_result` is None until a run has finished."""
+
+    defined: bool
+    loaded: bool
+    last_result: Optional[str]
+    script: Optional[Path]
+
+
+def agent_name() -> str:
+    # Tests and trial runs set this so they never touch the real agent.
+    return os.environ.get("CLAUDE_SESSION_MOVER_AGENT_NAME", DEFAULT_AGENT_NAME)
+
+
+def _require_agent_platform() -> None:
+    if sys.platform not in AGENT_INTERVAL_SECONDS:
+        raise UsageError("the sync agent runs on macOS (launchd) and Windows (Task Scheduler); elsewhere, "
+                         f"run '{PROG} sync --quiet' from a systemd timer or cron")
+
+
+def agent_log_path() -> Path:
+    return default_data_dir() / "sync.log"
+
+
+def agent_command(desktop_root: Path) -> List[str]:
+    python = sys.executable
+    if sys.platform == "win32":
+        windowless = Path(python).with_name("pythonw.exe")
+        python = str(windowless) if windowless.exists() else python
+    # -I keeps the user's site-packages and current folder out of the agent's imports; the tool is stdlib-only.
+    command = [python, "-I", str(Path(__file__).resolve()), "sync", "--quiet", "--desktop-root", str(desktop_root)]
+    if sys.platform == "win32":
+        command += ["--log", str(agent_log_path())]  # pythonw has no console, so sync writes the log itself
+    return command
+
+
+def agent_state() -> AgentState:
+    return _windows_task_state() if sys.platform == "win32" else _launch_agent_state()
+
+
+def install_agent(desktop_root: Path) -> None:
+    if sys.platform == "win32":
+        _install_windows_task(agent_command(desktop_root))
+    else:
+        _install_launch_agent(desktop_root)
+
+
+def uninstall_agent() -> bool:
+    """Remove the agent; False when there was none."""
+    return _uninstall_windows_task() if sys.platform == "win32" else _uninstall_launch_agent()
+
+
+def agent_problems(state: AgentState) -> List[str]:
+    """Everything wrong with the installed agent; empty when it is healthy."""
+    if not state.defined:
+        return [f"not installed; run '{PROG} install-agent'"]
+    problems = []
+    if state.script is None or not state.script.exists():
+        problems.append(f"script missing: {state.script}; run '{PROG} install-agent' again")
+    if not state.loaded:
+        problems.append(f"agent is not loaded; run '{PROG} install-agent' again")
+    if state.last_result not in (None, "0"):
+        problems.append(f"last run failed (exit code {state.last_result}); see {agent_log_path()}")
+    return problems
+
+
+# --- macOS
+
+
+def agent_plist_path() -> Path:
+    return Path.home() / "Library" / "LaunchAgents" / f"{agent_name()}.plist"
+
+
+def _launchctl(*args: str) -> subprocess.CompletedProcess:
+    binary = os.environ.get("CLAUDE_SESSION_MOVER_LAUNCHCTL", "launchctl")
+    return subprocess.run([binary, *args], capture_output=True, text=True, timeout=10)
+
+
+def _launchd_job() -> str:
+    return f"gui/{os.getuid()}/{agent_name()}"
+
+
+def _run_launchctl(*args: str) -> None:
+    done = _launchctl(*args)
+    if done.returncode != 0:
+        raise UsageError(f"launchctl {' '.join(args)} failed: {(done.stderr or done.stdout).strip()}")
+
+
+def _launch_agent_state() -> AgentState:
+    plist = agent_plist_path()
+    script = None
+    if plist.exists():
+        with plist.open("rb") as f:
+            arguments = plistlib.load(f).get("ProgramArguments", [])
+        script = Path(arguments[2]) if len(arguments) > 2 else None
+    shown = _launchctl("print", _launchd_job())
+    found = re.search(r"last exit code = (\S+)", shown.stdout) if shown.returncode == 0 else None
+    code = found.group(1) if found else None
+    return AgentState(defined=plist.exists(), loaded=shown.returncode == 0,
+                      last_result=None if code in (None, "(never") else code, script=script)
+
+
+def _install_launch_agent(desktop_root: Path) -> None:
+    plist = agent_plist_path()
+    plist.parent.mkdir(parents=True, exist_ok=True)
+    log = str(agent_log_path())
+    definition = {
+        "Label": agent_name(),
+        "ProgramArguments": agent_command(desktop_root),
+        # WatchPaths fires on changes to these folders themselves; the interval covers new account folders.
+        "WatchPaths": [str(desktop_root)] + [str(loc.root) for loc in desktop_locations(desktop_root)],
+        "StartInterval": AGENT_INTERVAL_SECONDS["darwin"],
+        "RunAtLoad": True,
+        "ProcessType": "Background",
+        "LowPriorityIO": True,
+        "StandardOutPath": log,
+        "StandardErrorPath": log,
+    }
+    if _launchctl("print", _launchd_job()).returncode == 0:
+        _run_launchctl("bootout", _launchd_job())
+    fd, tmp = tempfile.mkstemp(dir=plist.parent, prefix=".csm-")
+    with os.fdopen(fd, "wb") as f:
+        plistlib.dump(definition, f)
+    os.replace(tmp, plist)
+    _run_launchctl("bootstrap", f"gui/{os.getuid()}", str(plist))
+
+
+def _uninstall_launch_agent() -> bool:
+    plist = agent_plist_path()
+    loaded, defined = _launchctl("print", _launchd_job()).returncode == 0, plist.exists()
+    if loaded:
+        _run_launchctl("bootout", _launchd_job())
+    if defined:
+        plist.unlink()
+    return loaded or defined
+
+
+# --- Windows
+
+
+def _ps_quote(text: str) -> str:
+    return "'" + text.replace("'", "''") + "'"
+
+
+def _powershell(script: str) -> subprocess.CompletedProcess:
+    # Windows PowerShell 5.1 ships with every supported Windows and includes the ScheduledTasks module.
+    # Its cmdlets return numbers and enum names, unlike schtasks, whose output is translated per locale.
+    return subprocess.run(["powershell", "-NoProfile", "-NonInteractive", "-Command", script],
+                          capture_output=True, text=True, timeout=120)
+
+
+def _run_powershell(script: str, action: str) -> subprocess.CompletedProcess:
+    done = _powershell(script)
+    if done.returncode != 0:
+        raise UsageError(f"could not {action}: {(done.stderr or done.stdout).strip()}")
+    return done
+
+
+def windows_task_xml(command: Sequence[str]) -> str:
+    """Task Scheduler definition: every minute, hidden, as the signed-in user, one run at a time."""
+    from xml.sax.saxutils import escape
+
+    return f"""<?xml version="1.0" encoding="UTF-16"?>
+<Task version="1.2" xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task">
+  <RegistrationInfo>
+    <Description>Keeps every Claude Desktop account's Code-tab chat list the same ({PROG} sync).</Description>
+  </RegistrationInfo>
+  <Triggers>
+    <TimeTrigger>
+      <Repetition>
+        <Interval>PT1M</Interval>
+        <StopAtDurationEnd>false</StopAtDurationEnd>
+      </Repetition>
+      <StartBoundary>2026-01-01T00:00:00</StartBoundary>
+      <Enabled>true</Enabled>
+    </TimeTrigger>
+  </Triggers>
+  <Principals>
+    <Principal id="Author">
+      <LogonType>InteractiveToken</LogonType>
+      <RunLevel>LeastPrivilege</RunLevel>
+    </Principal>
+  </Principals>
+  <Settings>
+    <MultipleInstancesPolicy>IgnoreNew</MultipleInstancesPolicy>
+    <DisallowStartIfOnBatteries>false</DisallowStartIfOnBatteries>
+    <StopIfGoingOnBatteries>false</StopIfGoingOnBatteries>
+    <StartWhenAvailable>true</StartWhenAvailable>
+    <Hidden>true</Hidden>
+    <ExecutionTimeLimit>PT10M</ExecutionTimeLimit>
+    <Enabled>true</Enabled>
+  </Settings>
+  <Actions Context="Author">
+    <Exec>
+      <Command>{escape(command[0])}</Command>
+      <Arguments>{escape(subprocess.list2cmdline(list(command[1:])))}</Arguments>
+    </Exec>
+  </Actions>
+</Task>
+"""
+
+
+def _install_windows_task(command: Sequence[str]) -> None:
+    definition = default_data_dir() / "sync-task.xml"
+    definition.write_text(windows_task_xml(command), encoding="utf-16")
+    name = _ps_quote(agent_name())
+    _run_powershell(
+        f"Register-ScheduledTask -TaskName {name} -Xml (Get-Content -LiteralPath {_ps_quote(str(definition))} -Raw) "
+        f"-Force | Out-Null; Start-ScheduledTask -TaskName {name}",
+        "register the scheduled task")
+
+
+def _windows_task_state() -> AgentState:
+    shown = _run_powershell(
+        f"$t = Get-ScheduledTask -TaskName {_ps_quote(agent_name())} -ErrorAction SilentlyContinue; "
+        "if (-not $t) { 'absent'; exit 0 }; $i = $t | Get-ScheduledTaskInfo; "
+        "[string]$t.State; [string]$i.LastTaskResult; [string]$t.Actions[0].Arguments",
+        "read the scheduled task")
+    lines = shown.stdout.splitlines()
+    if not lines or lines[0].strip() == "absent":
+        return AgentState(defined=False, loaded=False, last_result=None, script=None)
+    state, result, arguments = (lines + ["", "", ""])[:3]
+    code = int(result) if result.strip().lstrip("-").isdigit() else None
+    script = re.search(r'-I\s+(?:"([^"]+)"|(\S+))', arguments)
+    return AgentState(
+        defined=True,
+        loaded=state.strip() != "Disabled",
+        last_result=None if code in (None, TASK_NEVER_RAN, TASK_RUNNING) else str(code),
+        script=Path(script.group(1) or script.group(2)) if script else None,
+    )
+
+
+def _uninstall_windows_task() -> bool:
+    removed = _run_powershell(
+        f"$t = Get-ScheduledTask -TaskName {_ps_quote(agent_name())} -ErrorAction SilentlyContinue; "
+        "if (-not $t) { 'absent'; exit 0 }; $t | Unregister-ScheduledTask -Confirm:$false; 'removed'",
+        "remove the scheduled task")
+    return removed.stdout.strip().endswith("removed")
+
+
 # --------------------------------------------------------------------------- safety checks
 
 
 def desktop_app_running() -> bool:
     """Claude Desktop rewrites its index when it quits, so writing while it runs gets undone."""
+    name = os.environ.get("CLAUDE_SESSION_MOVER_APP_NAME", "Claude")
+    if sys.platform == "win32":
+        listing = subprocess.run(["tasklist", "/FO", "CSV", "/NH"], capture_output=True, text=True,
+                                 errors="replace", timeout=15, check=True)
+        running = {row[0].lower() for row in csv.reader(listing.stdout.splitlines()) if row}
+        return f"{name}.exe".lower() in running
     if sys.platform != "darwin":
         return False
-    name = os.environ.get("CLAUDE_SESSION_MOVER_APP_NAME", "Claude")
     # pgrep -x misses the app on some macOS setups while ps lists it, so match ps's command paths.
     # The match is case-sensitive on purpose: the bundled CLI runs as .../MacOS/claude.
     listing = subprocess.run(["ps", "-axo", "comm="], capture_output=True, text=True, timeout=5, check=True)
@@ -666,6 +1090,74 @@ def cmd_restore(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_sync(args: argparse.Namespace) -> int:
+    if args.log is None:
+        return _sync_once(args)
+    args.log.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    with args.log.open("a", encoding="utf-8") as log, contextlib.redirect_stdout(log), contextlib.redirect_stderr(log):
+        try:
+            return _sync_once(args)
+        except Exception:  # the agent has no console: the traceback goes to the log and the exit code to the OS
+            traceback.print_exc()
+            return 1
+
+
+def _sync_once(args: argparse.Namespace) -> int:
+    # No running-app check and no per-run backup: sync is meant to run every few seconds while
+    # Claude Desktop is open, and whatever the app rewrites is picked up by the next run.
+    with sync_lock(args.desktop_root) as held:
+        if not held:
+            return 0
+        folders, ops = plan_sync(args.desktop_root)
+        if not args.dry_run:
+            apply_sync(ops, args.desktop_root, args.trash or default_data_dir() / "removed")
+    if not ops:
+        if not args.quiet:
+            print(f"{len(folders)} account folders in step, nothing to do")
+        return 0
+    prefix = time.strftime("[%Y-%m-%d %H:%M:%S] ") if args.quiet else ""
+    verb = "would " if args.dry_run else ""
+    for line in sync_summary(ops):
+        print(f"{prefix}{verb}{line}")
+    return 0
+
+
+def cmd_install_agent(args: argparse.Namespace) -> int:
+    _require_agent_platform()
+    if not args.desktop_root.is_dir():
+        raise UsageError(f"no Claude Desktop sessions folder at {args.desktop_root}")
+    agent_log_path().parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    install_agent(args.desktop_root)
+    every = AGENT_INTERVAL_SECONDS[sys.platform]
+    trigger = " and on folder changes" if sys.platform == "darwin" else ""
+    print(f"Installed and started {agent_name()}: syncs {args.desktop_root} every {every} s{trigger}.")
+    print(f"Log: {agent_log_path()}")
+    print(f"Check it with '{PROG} status'; stop it with '{PROG} uninstall-agent'.")
+    return 0
+
+
+def cmd_uninstall_agent(args: argparse.Namespace) -> int:
+    _require_agent_platform()
+    print(f"Removed {agent_name()}." if uninstall_agent() else f"{agent_name()} was not installed.")
+    return 0
+
+
+def cmd_status(args: argparse.Namespace) -> int:
+    """Exit 0 when the agent is healthy, 1 when it is not, so hooks and scripts can test it."""
+    _require_agent_platform()
+    problems = agent_problems(agent_state())
+    folders, ops = plan_sync(args.desktop_root)
+    pending = f"{len(ops)} changes waiting for the next run" if ops else "in step"
+    print(f"{len(folders)} Claude Desktop account folders in {args.desktop_root}: {pending}")
+    if not problems:
+        print(f"Sync agent {agent_name()}: healthy")
+        return 0
+    print(f"Sync agent {agent_name()}: NOT working")
+    for problem in problems:
+        print(f"  - {problem}")
+    return 1
+
+
 def _add_app_flags(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--wait-for-app-exit", type=int, nargs="?", const=600, default=0, metavar="SECONDS",
                         help="if Claude Desktop is running, wait for it to quit (default 600 s), then write")
@@ -679,7 +1171,8 @@ def build_parser() -> argparse.ArgumentParser:
                         help="Claude Desktop's claude-code-sessions folder (env CLAUDE_DESKTOP_SESSIONS_DIR)")
     common.add_argument("--backup-dir", type=Path, default=None,
                         help="where backups go (env CLAUDE_SESSION_MOVER_BACKUP_DIR; "
-                             "default ~/.local/share/claude-session-mover/backups)")
+                             "default: ~/.local/share/claude-session-mover/backups, "
+                             "%%LOCALAPPDATA%%\\claude-session-mover\\backups on Windows)")
 
     parser = argparse.ArgumentParser(prog=PROG, description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--version", action="version", version=f"{PROG} {__version__}")
@@ -712,6 +1205,27 @@ def build_parser() -> argparse.ArgumentParser:
     restore.add_argument("--dry-run", action="store_true")
     _add_app_flags(restore)
     restore.set_defaults(handler=cmd_restore)
+
+    sync = commands.add_parser(
+        "sync", parents=[common], help="make every Claude Desktop account show the same chats",
+        description="Bring every <account>/<org> folder to the newest copy of every file. Chat index files: the "
+                    "larger lastActivityAt wins, then the newer mtime; other files: the newer mtime wins. A "
+                    "deleted_<id> marker moves that chat out of every folder into --trash. Safe to run repeatedly.")
+    sync.add_argument("--dry-run", action="store_true", help="print every change and make none")
+    sync.add_argument("--quiet", action="store_true", help="print only when something changed (for the agent)")
+    sync.add_argument("--log", type=Path, default=None, help="append output and errors to this file")
+    sync.add_argument("--trash", type=Path, default=None,
+                      help="where chats deleted in another account are moved "
+                           "(default: the data folder's removed/; see 'status' for the data folder)")
+    sync.set_defaults(handler=cmd_sync)
+
+    for name, summary, handler in (
+        ("install-agent", "run 'sync' automatically: a LaunchAgent on macOS (every 20 s and on changes), "
+                          "a scheduled task on Windows (every minute)", cmd_install_agent),
+        ("uninstall-agent", "stop and remove the sync agent", cmd_uninstall_agent),
+        ("status", "is the sync agent installed, loaded and succeeding? (exit 1 when not)", cmd_status),
+    ):
+        commands.add_parser(name, parents=[common], help=summary, description=summary).set_defaults(handler=handler)
     return parser
 
 
